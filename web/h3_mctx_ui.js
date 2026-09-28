@@ -2813,6 +2813,9 @@ app.registerExtension({
                 "Write the current cut to the output folder under "
                 + "filename_prefix (byte-identical to the full preview; "
                 + "rebuilds first if the preview is stale)");
+            const openBtn = mkBtn("open…",
+                "Browse output folders and restore the timeline saved "
+                + "there (obvpm_h3_timeline.sequence)");
             const stateChip = document.createElement("span");
             Object.assign(stateChip.style, {
                 font: "12px sans-serif", color: "#9aa1ac",
@@ -3409,7 +3412,8 @@ app.registerExtension({
 
             header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
                           seamBtn, zoomOutBtn, zoomInBtn,
-                          fitBtn, addBtn, editBtn, exportBtn, runModeBtn);
+                          fitBtn, addBtn, editBtn, openBtn, exportBtn,
+                          runModeBtn);
             // "next run" config bar: reserved space right below the
             // strip, ALWAYS visible -- states what the pin_specs output
             // will do (root generation vs extend/prepend) and carries
@@ -3560,10 +3564,13 @@ app.registerExtension({
                     clearTimeout(deb);
                     deb = setTimeout(apply, 300);
                 });
-                // canvas hotkeys (Delete removes the NODE) must not see
-                // keystrokes meant for the textarea
-                ta.addEventListener("keydown",
-                    (ev) => ev.stopPropagation());
+                // canvas hotkeys (Delete removes the NODE) and workflow
+                // paste must not see events meant for the textarea
+                for (const evName of ["keydown", "keyup", "paste",
+                                      "copy", "cut"]) {
+                    ta.addEventListener(evName,
+                        (ev) => ev.stopPropagation());
+                }
                 pop._flush = () => {
                     if (deb !== null) {
                         clearTimeout(deb);
@@ -3810,7 +3817,7 @@ app.registerExtension({
                 // keeps mkBtn's hardcoded dark and reads as a foreign
                 // control on a light theme.
                 for (const el of [picker, addBtn, editBtn, quickBtn,
-                                  fullBtn, exportBtn, seamBtn,
+                                  fullBtn, openBtn, exportBtn, seamBtn,
                                   zoomOutBtn, zoomInBtn, fitBtn]) {
                     el.style.background = PAL.rest;
                     el.style.borderColor = PAL.edge;
@@ -4403,16 +4410,18 @@ app.registerExtension({
             tlWheelToCanvas(container);
 
             // ---- sequence editing (text widget = source of truth) -----
+            let queueTimelinePersist = () => {};
             function currentLines() {
                 return String(seqWidget.value || "").split("\n");
             }
-            function setSequence(text) {
+            function setSequence(text, opts) {
                 seqWidget.value = text;
                 const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
                 if (seqEl2) seqEl2.value = text;
                 seqWidget.callback?.(text);
                 tlNoteEdit();      // one undo step per edit
                 void refresh();
+                if (!opts?.skipPersist) queueTimelinePersist();
             }
             function entryLines() {
                 // indices of entry lines (not comments, not the loop
@@ -5210,6 +5219,379 @@ app.registerExtension({
                 return String(v).trim().replace(/\\/g, "/")
                     .replace(/^\/+|\/+$/g, "");
             }
+            function baseFolderWired() {
+                return (node.inputs ?? []).some(
+                    (s) => (s.widget?.name === "base_folder"
+                            || s.name === "base_folder")
+                        && s.link != null);
+            }
+            function openFolderBlocked() {
+                return baseFolderWired()
+                    && rpWidgetValue(node, "base_folder") === null;
+            }
+            function paintOpenBtn() {
+                const blocked = openFolderBlocked();
+                openBtn.disabled = blocked;
+                openBtn.style.opacity = blocked ? "0.45" : "1";
+                openBtn.style.cursor = blocked ? "default" : "pointer";
+                openBtn.title = blocked
+                    ? "base_folder is wired from something this widget "
+                      + "cannot read — change it upstream, or type the "
+                      + "folder on the node directly."
+                    : "Browse output folders and restore the "
+                      + "timeline saved there (obvpm_h3_timeline.sequence)";
+            }
+            paintOpenBtn();
+            const onConnOpen = node.onConnectionsChange;
+            node.onConnectionsChange = function (...args) {
+                const r = onConnOpen?.apply(this, args);
+                paintOpenBtn();
+                return r;
+            };
+            let persistTimer = null;
+            let skipTimelinePersist = false;
+            queueTimelinePersist = () => {
+                if (skipTimelinePersist || openFolderBlocked()) return;
+                const folder = folderValue();
+                clearTimeout(persistTimer);
+                persistTimer = setTimeout(() => {
+                    void api.fetchApi("/obvpm/h3/timeline_state", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            action: "save",
+                            base_folder: folder,
+                            sequence: seqWidget.value ?? "",
+                        }),
+                    }).catch(() => {});
+                }, 1000);
+            };
+            let openMenu = null;
+            function closeOpenMenu() {
+                openMenu?.remove();
+                openMenu = null;
+            }
+            async function loadTimelineFolder(folder) {
+                const resp = await api.fetchApi("/obvpm/h3/timeline_state", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        action: "load", base_folder: folder,
+                    }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                return resp.json();
+            }
+            async function applyOpenFolder(folder) {
+                const cur = String(seqWidget.value || "").trim();
+                if (cur && tlParseSequence(cur).length) {
+                    const label = folder || "(output root)";
+                    if (!confirm(
+                        "Replace the current timeline with the cut saved "
+                        + "in " + label + "?")) return;
+                }
+                skipTimelinePersist = true;
+                try {
+                    if (!baseFolderWired()) {
+                        const fw = node.widgets?.find(
+                            (w) => w.name === "base_folder");
+                        if (fw) {
+                            fw.value = folder;
+                            fw.callback?.(folder, app.canvas, node);
+                        }
+                    }
+                    const data = await loadTimelineFolder(folder);
+                    if (data.found) {
+                        setSequence(data.sequence ?? "", { skipPersist: true });
+                    } else {
+                        setSequence("", { skipPersist: true });
+                        app.extensionManager?.toast?.add?.({
+                            severity: "info",
+                            summary: "H3 Timeline",
+                            detail: "No saved timeline in this folder yet "
+                                + "(obvpm_h3_timeline.sequence).",
+                            life: 5000,
+                        });
+                    }
+                    single = null;
+                    usingSingle = false;
+                    await rescanPickerClips().catch(() => populatePicker());
+                    node.setDirtyCanvas?.(true, true);
+                } finally {
+                    skipTimelinePersist = false;
+                }
+            }
+            function normalizeFolderInput(raw) {
+                return String(raw ?? "").trim().replace(/\\/g, "/")
+                    .replace(/^\/+|\/+$/g, "");
+            }
+            async function fetchFolderList(query) {
+                const resp = await api.fetchApi("/obvpm/h3/list_folders", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ query: query ?? "" }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                return resp.json();
+            }
+            async function fetchFolderBrowse(parent) {
+                const resp = await api.fetchApi("/obvpm/h3/list_folders", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ parent: parent ?? "" }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                return resp.json();
+            }
+            async function openFolderMenu() {
+                if (openFolderBlocked()) return;
+                if (openMenu) {
+                    closeOpenMenu();
+                    return;
+                }
+                const pop = document.createElement("div");
+                openMenu = pop;
+                Object.assign(pop.style, {
+                    position: "absolute", zIndex: "11",
+                    left: "8px", minWidth: "280px", maxWidth: "85%",
+                    top: (header.offsetTop + header.offsetHeight + 4)
+                        + "px",
+                    maxHeight: "min(380px, 55vh)",
+                    display: "flex", flexDirection: "column", gap: "4px",
+                    background: PAL.rest, color: PAL.text,
+                    border: "1px solid " + PAL.edge,
+                    borderRadius: "5px", padding: "4px",
+                    font: "11px sans-serif",
+                    boxShadow: "0 4px 14px rgba(0,0,0,0.45)",
+                });
+                pop.addEventListener("click", (ev) => ev.stopPropagation());
+                const searchIn = document.createElement("input");
+                searchIn.type = "search";
+                searchIn.placeholder = "Search, or drill in below…";
+                searchIn.autocomplete = "off";
+                Object.assign(searchIn.style, {
+                    width: "100%", boxSizing: "border-box",
+                    padding: "4px 6px", borderRadius: "4px",
+                    border: "1px solid " + PAL.edge,
+                    background: PAL.stripBg ?? "#1a1d22",
+                    color: PAL.text, font: "11px sans-serif",
+                    flexShrink: "0",
+                });
+                const crumb = document.createElement("div");
+                Object.assign(crumb.style, {
+                    display: "flex", flexWrap: "wrap", gap: "2px",
+                    alignItems: "center", padding: "0 2px",
+                    color: PAL.sub, flexShrink: "0",
+                });
+                const useBtn = document.createElement("button");
+                useBtn.type = "button";
+                Object.assign(useBtn.style, {
+                    alignSelf: "flex-start",
+                    background: PAL.rest, color: PAL.text,
+                    border: "1px solid " + PAL.edge, borderRadius: "4px",
+                    padding: "2px 8px", cursor: "pointer",
+                    font: "11px/16px sans-serif", flexShrink: "0",
+                });
+                const listEl = document.createElement("div");
+                Object.assign(listEl.style, {
+                    overflowY: "auto", flex: "1", minHeight: "80px",
+                });
+                pop.append(searchIn, crumb, useBtn, listEl);
+                container.appendChild(pop);
+                setTimeout(() => {
+                    document.addEventListener("click", closeOpenMenu,
+                        { once: true });
+                    searchIn.focus();
+                }, 0);
+                const here = folderValue();
+                let cwd = here;
+                let searchTimer = null;
+                let lastFolders = [];
+                const hoverRow = (el) => {
+                    el.addEventListener("mouseenter", () =>
+                        el.style.background = PAL.active);
+                    el.addEventListener("mouseleave", () =>
+                        el.style.background = "none");
+                };
+                const paintCrumbs = (folder) => {
+                    crumb.replaceChildren();
+                    const parts = folder ? folder.split("/") : [];
+                    const addSeg = (label, path) => {
+                        const b = document.createElement("span");
+                        b.textContent = label;
+                        b.title = path || "output root";
+                        Object.assign(b.style, {
+                            cursor: "pointer", padding: "1px 3px",
+                            borderRadius: "3px",
+                        });
+                        hoverRow(b);
+                        b.addEventListener("click", () => {
+                            searchIn.value = "";
+                            void showBrowse(path);
+                        });
+                        crumb.appendChild(b);
+                    };
+                    addSeg("output", "");
+                    parts.forEach((seg, i) => {
+                        const slash = document.createElement("span");
+                        slash.textContent = "/";
+                        slash.style.opacity = "0.5";
+                        crumb.appendChild(slash);
+                        addSeg(seg, parts.slice(0, i + 1).join("/"));
+                    });
+                };
+                const paintUse = (folder) => {
+                    const label = folder || "(output root)";
+                    useBtn.textContent = "Open this folder";
+                    useBtn.title = label;
+                    useBtn.onclick = () => {
+                        closeOpenMenu();
+                        void applyOpenFolder(folder);
+                    };
+                };
+                const addRow = (text, title, onClick, extra) => {
+                    const it = document.createElement("div");
+                    it.textContent = text;
+                    it.title = title;
+                    Object.assign(it.style, {
+                        padding: "3px 5px", borderRadius: "3px",
+                        cursor: "pointer", whiteSpace: "nowrap",
+                        overflow: "hidden", textOverflow: "ellipsis",
+                        ...extra,
+                    });
+                    hoverRow(it);
+                    it.addEventListener("click", onClick);
+                    listEl.appendChild(it);
+                    return it;
+                };
+                const fillSearch = (list, truncated) => {
+                    lastFolders = list;
+                    listEl.replaceChildren();
+                    crumb.replaceChildren();
+                    const q = normalizeFolderInput(searchIn.value);
+                    paintUse(q);
+                    const exact = list.some((f) => f === q);
+                    if (q && !exact) {
+                        addRow("Open folder: " + q, q, () => {
+                            closeOpenMenu();
+                            void applyOpenFolder(q);
+                        }, { fontWeight: "600",
+                             borderBottom: "1px solid " + PAL.edge,
+                             marginBottom: "2px" });
+                    }
+                    if (!list.length) {
+                        const n = document.createElement("div");
+                        n.textContent = q
+                            ? "No matches — Open this folder uses the typed path."
+                            : "No project folders yet.";
+                        n.style.color = PAL.sub;
+                        n.style.padding = "3px 5px";
+                        listEl.appendChild(n);
+                        return;
+                    }
+                    if (truncated) {
+                        const n = document.createElement("div");
+                        n.textContent = "Showing first matches — narrow your "
+                            + "search, or clear it to browse.";
+                        n.style.color = PAL.sub;
+                        n.style.padding = "2px 5px 4px";
+                        listEl.appendChild(n);
+                    }
+                    for (const f of list) {
+                        addRow(f || "(output root)", f || "output root",
+                            () => { void showBrowse(f); },
+                            { fontWeight: f === here ? "600" : "normal" });
+                    }
+                };
+                const fillBrowse = (listing) => {
+                    cwd = listing.folder ?? "";
+                    lastFolders = (listing.children ?? []).map((c) => c.path);
+                    paintCrumbs(cwd);
+                    paintUse(cwd);
+                    listEl.replaceChildren();
+                    if (listing.parent != null) {
+                        addRow("↑  ..", "Up one folder", () => {
+                            void showBrowse(listing.parent);
+                        }, { color: PAL.sub });
+                    }
+                    const kids = listing.children ?? [];
+                    if (!kids.length) {
+                        const n = document.createElement("div");
+                        n.textContent = "No subfolders — Open this folder, "
+                            + "or go up.";
+                        n.style.color = PAL.sub;
+                        n.style.padding = "3px 5px";
+                        listEl.appendChild(n);
+                        return;
+                    }
+                    for (const c of kids) {
+                        addRow(c.name + "  ›", c.path, () => {
+                            void showBrowse(c.path);
+                        }, { fontWeight: c.path === here ? "600" : "normal" });
+                    }
+                };
+                const showBrowse = async (parent) => {
+                    listEl.textContent = "loading…";
+                    listEl.style.color = PAL.sub;
+                    try {
+                        const j = await fetchFolderBrowse(parent);
+                        if (openMenu !== pop) return;
+                        listEl.style.color = PAL.text;
+                        fillBrowse(j);
+                    } catch {
+                        if (openMenu !== pop) return;
+                        if (parent) {
+                            void showBrowse("");
+                            return;
+                        }
+                        listEl.textContent = "could not list this folder";
+                    }
+                };
+                const runSearch = async () => {
+                    const q = searchIn.value.trim();
+                    if (!q) {
+                        void showBrowse(cwd);
+                        return;
+                    }
+                    listEl.textContent = "searching…";
+                    listEl.style.color = PAL.sub;
+                    try {
+                        const j = await fetchFolderList(searchIn.value);
+                        if (openMenu !== pop) return;
+                        listEl.style.color = PAL.text;
+                        fillSearch(j.folders ?? [], !!j.truncated);
+                    } catch {
+                        if (openMenu !== pop) return;
+                        listEl.textContent = "could not list folders";
+                    }
+                };
+                searchIn.addEventListener("input", () => {
+                    clearTimeout(searchTimer);
+                    searchTimer = setTimeout(() => void runSearch(), 200);
+                });
+                // canvas hotkeys and workflow paste must not see events
+                // meant for this field (paste of graph JSON would spawn
+                // Load Clip / Load VAE nodes on the canvas)
+                for (const evName of ["keydown", "keyup", "paste",
+                                      "copy", "cut"]) {
+                    searchIn.addEventListener(evName,
+                        (ev) => ev.stopPropagation());
+                }
+                searchIn.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "Enter") return;
+                    ev.preventDefault();
+                    const q = normalizeFolderInput(searchIn.value);
+                    closeOpenMenu();
+                    void applyOpenFolder(q || cwd);
+                });
+                searchIn.addEventListener("pointerdown", (ev) =>
+                    ev.stopPropagation());
+                void showBrowse(cwd);
+            }
+            openBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                void openFolderMenu();
+            });
             // The seam-repair settings, sent with every build. They are
             // part of the server's cache key, so changing one rebuilds
             // rather than serving a preview made under the old setting.
