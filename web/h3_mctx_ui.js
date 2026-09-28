@@ -2759,8 +2759,10 @@ app.registerExtension({
 
             // ---- header: clip picker + preview control ----------------
             const header = document.createElement("div");
-            Object.assign(header.style,
-                { display: "flex", gap: "6px", alignItems: "center" });
+            Object.assign(header.style, {
+                display: "flex", gap: "6px", alignItems: "center",
+                flexWrap: "wrap",
+            });
             const picker = document.createElement("select");
             Object.assign(picker.style, {
                 flex: "1", minWidth: "0", background: "#2a2e36",
@@ -2816,6 +2818,9 @@ app.registerExtension({
             const openBtn = mkBtn("open…",
                 "Browse output folders and restore the timeline saved "
                 + "there (obvpm_h3_timeline.sequence)");
+            const newBtn = mkBtn("new…",
+                "Start a new project: clear the timeline and pick a "
+                + "folder (creates it if needed)");
             const stateChip = document.createElement("span");
             Object.assign(stateChip.style, {
                 font: "12px sans-serif", color: "#9aa1ac",
@@ -3412,8 +3417,8 @@ app.registerExtension({
 
             header.append(quickBtn, fullBtn, stateChip, snapBtn, loopBtn,
                           seamBtn, zoomOutBtn, zoomInBtn,
-                          fitBtn, addBtn, editBtn, openBtn, exportBtn,
-                          runModeBtn);
+                          fitBtn, addBtn, editBtn, newBtn, openBtn,
+                          exportBtn, runModeBtn);
             // "next run" config bar: reserved space right below the
             // strip, ALWAYS visible -- states what the pin_specs output
             // will do (root generation vs extend/prepend) and carries
@@ -3817,8 +3822,8 @@ app.registerExtension({
                 // keeps mkBtn's hardcoded dark and reads as a foreign
                 // control on a light theme.
                 for (const el of [picker, addBtn, editBtn, quickBtn,
-                                  fullBtn, openBtn, exportBtn, seamBtn,
-                                  zoomOutBtn, zoomInBtn, fitBtn]) {
+                                  fullBtn, newBtn, openBtn, exportBtn,
+                                  seamBtn, zoomOutBtn, zoomInBtn, fitBtn]) {
                     el.style.background = PAL.rest;
                     el.style.borderColor = PAL.edge;
                     el.style.color = PAL.text;
@@ -5250,19 +5255,32 @@ app.registerExtension({
             };
             let persistTimer = null;
             let skipTimelinePersist = false;
+            function persistBody() {
+                return {
+                    action: "save",
+                    base_folder: folderValue(),
+                    sequence: seqWidget.value ?? "",
+                };
+            }
+            async function persistTimelineNow() {
+                if (skipTimelinePersist || openFolderBlocked()) return;
+                clearTimeout(persistTimer);
+                try {
+                    await api.fetchApi("/obvpm/h3/timeline_state", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(persistBody()),
+                    });
+                } catch { /* offline */ }
+            }
             queueTimelinePersist = () => {
                 if (skipTimelinePersist || openFolderBlocked()) return;
-                const folder = folderValue();
                 clearTimeout(persistTimer);
                 persistTimer = setTimeout(() => {
                     void api.fetchApi("/obvpm/h3/timeline_state", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({
-                            action: "save",
-                            base_folder: folder,
-                            sequence: seqWidget.value ?? "",
-                        }),
+                        body: JSON.stringify(persistBody()),
                     }).catch(() => {});
                 }, 1000);
             };
@@ -5321,6 +5339,58 @@ app.registerExtension({
                     skipTimelinePersist = false;
                 }
             }
+            async function ensureFolder(folder) {
+                const resp = await api.fetchApi("/obvpm/h3/ensure_folder", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ base_folder: folder ?? "" }),
+                });
+                if (!resp.ok) throw new Error(await resp.text());
+                const j = await resp.json();
+                return j.folder ?? folder;
+            }
+            async function applyStartNew(folder) {
+                const cur = String(seqWidget.value || "").trim();
+                if (cur && tlParseSequence(cur).length) {
+                    if (!confirm(
+                        "Start a new project? The strip will be cleared. "
+                        + "The current cut stays saved in its folder.")) {
+                        return;
+                    }
+                }
+                await persistTimelineNow();
+                skipTimelinePersist = true;
+                try {
+                    if (!baseFolderWired()) {
+                        folder = await ensureFolder(folder);
+                        const fw = node.widgets?.find(
+                            (w) => w.name === "base_folder");
+                        if (fw) {
+                            fw.value = folder;
+                            fw.callback?.(folder, app.canvas, node);
+                        }
+                    } else {
+                        app.extensionManager?.toast?.add?.({
+                            severity: "info",
+                            summary: "H3 Timeline",
+                            detail: "base_folder is wired from another node, "
+                                + "so only the strip is cleared. Change the "
+                                + "folder on that source if this is a new "
+                                + "project directory.",
+                            life: 6000,
+                        });
+                    }
+                    setPinState(null);
+                    setSequence("", { skipPersist: true });
+                    single = null;
+                    usingSingle = false;
+                    await rescanPickerClips().catch(() => populatePicker());
+                    node.setDirtyCanvas?.(true, true);
+                } finally {
+                    skipTimelinePersist = false;
+                    queueTimelinePersist();
+                }
+            }
             function normalizeFolderInput(raw) {
                 return String(raw ?? "").trim().replace(/\\/g, "/")
                     .replace(/^\/+|\/+$/g, "");
@@ -5343,8 +5413,9 @@ app.registerExtension({
                 if (!resp.ok) throw new Error(await resp.text());
                 return resp.json();
             }
-            async function openFolderMenu() {
-                if (openFolderBlocked()) return;
+            async function openFolderMenu(purpose) {
+                purpose = purpose === "new" ? "new" : "open";
+                if (openFolderBlocked() && purpose !== "new") return;
                 if (openMenu) {
                     closeOpenMenu();
                     return;
@@ -5367,7 +5438,9 @@ app.registerExtension({
                 pop.addEventListener("click", (ev) => ev.stopPropagation());
                 const searchIn = document.createElement("input");
                 searchIn.type = "search";
-                searchIn.placeholder = "Search, or drill in below…";
+                searchIn.placeholder = purpose === "new"
+                    ? "Search, or create a folder below…"
+                    : "Search, or drill in below…";
                 searchIn.autocomplete = "off";
                 Object.assign(searchIn.style, {
                     width: "100%", boxSizing: "border-box",
@@ -5396,7 +5469,33 @@ app.registerExtension({
                 Object.assign(listEl.style, {
                     overflowY: "auto", flex: "1", minHeight: "80px",
                 });
-                pop.append(searchIn, crumb, useBtn, listEl);
+                const createWrap = document.createElement("div");
+                Object.assign(createWrap.style, {
+                    display: purpose === "new" ? "flex" : "none",
+                    gap: "4px", alignItems: "center", flexShrink: "0",
+                });
+                const createIn = document.createElement("input");
+                createIn.type = "text";
+                createIn.placeholder = "New folder name";
+                createIn.autocomplete = "off";
+                Object.assign(createIn.style, {
+                    flex: "1", minWidth: "0",
+                    padding: "4px 6px", borderRadius: "4px",
+                    border: "1px solid " + PAL.edge,
+                    background: PAL.stripBg ?? "#1a1d22",
+                    color: PAL.text, font: "11px sans-serif",
+                });
+                const createBtn = document.createElement("button");
+                createBtn.type = "button";
+                createBtn.textContent = "Create";
+                Object.assign(createBtn.style, {
+                    background: PAL.rest, color: PAL.text,
+                    border: "1px solid " + PAL.edge, borderRadius: "4px",
+                    padding: "2px 8px", cursor: "pointer",
+                    font: "11px/16px sans-serif", flexShrink: "0",
+                });
+                createWrap.append(createIn, createBtn);
+                pop.append(searchIn, crumb, createWrap, useBtn, listEl);
                 container.appendChild(pop);
                 setTimeout(() => {
                     document.addEventListener("click", closeOpenMenu,
@@ -5442,11 +5541,13 @@ app.registerExtension({
                 };
                 const paintUse = (folder) => {
                     const label = folder || "(output root)";
-                    useBtn.textContent = "Open this folder";
+                    useBtn.textContent = purpose === "new"
+                        ? "Start here" : "Open this folder";
                     useBtn.title = label;
                     useBtn.onclick = () => {
                         closeOpenMenu();
-                        void applyOpenFolder(folder);
+                        if (purpose === "new") void applyStartNew(folder);
+                        else void applyOpenFolder(folder);
                     };
                 };
                 const addRow = (text, title, onClick, extra) => {
@@ -5472,9 +5573,11 @@ app.registerExtension({
                     paintUse(q);
                     const exact = list.some((f) => f === q);
                     if (q && !exact) {
-                        addRow("Open folder: " + q, q, () => {
+                        addRow((purpose === "new" ? "Start in: " : "Open folder: ")
+                            + q, q, () => {
                             closeOpenMenu();
-                            void applyOpenFolder(q);
+                            if (purpose === "new") void applyStartNew(q);
+                            else void applyOpenFolder(q);
                         }, { fontWeight: "600",
                              borderBottom: "1px solid " + PAL.edge,
                              marginBottom: "2px" });
@@ -5517,8 +5620,9 @@ app.registerExtension({
                     const kids = listing.children ?? [];
                     if (!kids.length) {
                         const n = document.createElement("div");
-                        n.textContent = "No subfolders — Open this folder, "
-                            + "or go up.";
+                        n.textContent = "No subfolders — "
+                            + (purpose === "new" ? "Start here" : "Open this folder")
+                            + ", or go up.";
                         n.style.color = PAL.sub;
                         n.style.padding = "3px 5px";
                         listEl.appendChild(n);
@@ -5582,15 +5686,56 @@ app.registerExtension({
                     ev.preventDefault();
                     const q = normalizeFolderInput(searchIn.value);
                     closeOpenMenu();
-                    void applyOpenFolder(q || cwd);
+                    if (purpose === "new") void applyStartNew(q || cwd);
+                    else void applyOpenFolder(q || cwd);
                 });
                 searchIn.addEventListener("pointerdown", (ev) =>
                     ev.stopPropagation());
+                for (const evName of ["keydown", "keyup", "paste",
+                                      "copy", "cut"]) {
+                    createIn.addEventListener(evName,
+                        (ev) => ev.stopPropagation());
+                }
+                createIn.addEventListener("pointerdown", (ev) =>
+                    ev.stopPropagation());
+                const makeChildFolder = async () => {
+                    const name = normalizeFolderInput(createIn.value);
+                    if (!name || name.includes("/")) {
+                        createIn.focus();
+                        return;
+                    }
+                    const dest = cwd ? cwd + "/" + name : name;
+                    try {
+                        await ensureFolder(dest);
+                        createIn.value = "";
+                        void showBrowse(dest);
+                    } catch (err) {
+                        listEl.textContent = "could not create folder: "
+                            + String(err?.message ?? err).slice(0, 80);
+                    }
+                };
+                createBtn.addEventListener("click", (ev) => {
+                    ev.stopPropagation();
+                    void makeChildFolder();
+                });
+                createIn.addEventListener("keydown", (ev) => {
+                    if (ev.key !== "Enter") return;
+                    ev.preventDefault();
+                    void makeChildFolder();
+                });
                 void showBrowse(cwd);
             }
             openBtn.addEventListener("click", (ev) => {
                 ev.stopPropagation();
-                void openFolderMenu();
+                void openFolderMenu("open");
+            });
+            newBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                if (baseFolderWired()) {
+                    void applyStartNew(folderValue());
+                    return;
+                }
+                void openFolderMenu("new");
             });
             // The seam-repair settings, sent with every build. They are
             // part of the server's cache key, so changing one rebuilds

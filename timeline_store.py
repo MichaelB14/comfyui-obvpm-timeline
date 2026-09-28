@@ -129,3 +129,16 @@ def browse_folder(parent):
     if sub:
         up = sub.rsplit("/", 1)[0] if "/" in sub else ""
     return {"folder": sub, "parent": up, "children": children}
+
+
+def ensure_folder(base_folder):
+    """Create an output-relative folder (and parents). Returns the path."""
+    sub = folder_text(base_folder)
+    root = _output_root()
+    path = root if not sub else os.path.abspath(
+        os.path.join(root, sub.replace("/", os.sep)))
+    if os.path.commonpath([root, path]) != root:
+        raise ValueError(
+            "new folder escapes the output folder: %r" % sub)
+    os.makedirs(path, exist_ok=True)
+    return sub

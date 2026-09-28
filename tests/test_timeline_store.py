@@ -71,6 +71,12 @@ class TimelineStoreTests(unittest.TestCase):
         self.assertIsNone(root["parent"])
         self.assertIn("a", [c["name"] for c in root["children"]])
 
+    def test_ensure_folder_creates_and_refuses_traversal(self):
+        self.assertEqual(ts.ensure_folder("a/b/c"), "a/b/c")
+        self.assertTrue(os.path.isdir(os.path.join(self.tmp.name, "a", "b", "c")))
+        with self.assertRaises(ValueError):
+            ts.ensure_folder("../outside")
+
     def test_browse_traversal_refused(self):
         with self.assertRaises(ValueError):
             ts.browse_folder("../outside")

@@ -1445,6 +1445,20 @@ def register():
                            type(exc).__name__, exc)
             return web.json_response({"error": str(exc)}, status=400)
 
+    @PromptServer.instance.routes.post("/obvpm/h3/ensure_folder")
+    async def _ensure_folder(request):
+        import asyncio
+        try:
+            data = await request.json()
+            folder = await asyncio.to_thread(
+                timeline_store.ensure_folder,
+                str(data.get("base_folder", "") or ""))
+            return web.json_response({"folder": folder})
+        except Exception as exc:
+            _LOG.exception("obvpm.h3: ensure_folder failed: %s: %s",
+                           type(exc).__name__, exc)
+            return web.json_response({"error": str(exc)}, status=400)
+
     @PromptServer.instance.routes.post("/obvpm/h3/timeline_state")
     async def _timeline_state(request):
         import asyncio
@@ -1471,4 +1485,5 @@ def register():
               "(/obvpm/h3/preview_cut, /obvpm/h3/export, "
               "/obvpm/h3/delete_take, /obvpm/h3/video_workflow, "
               "/obvpm/h3/seam_levels, /obvpm/h3/clip_meta, "
-              "/obvpm/h3/list_folders, /obvpm/h3/timeline_state)")
+              "/obvpm/h3/list_folders, /obvpm/h3/ensure_folder, "
+              "/obvpm/h3/timeline_state)")
