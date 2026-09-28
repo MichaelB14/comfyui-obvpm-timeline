@@ -4423,8 +4423,12 @@ app.registerExtension({
                 seqWidget.value = text;
                 const seqEl2 = seqWidget.element ?? seqWidget.inputEl;
                 if (seqEl2) seqEl2.value = text;
-                seqWidget.callback?.(text);
-                tlNoteEdit();      // one undo step per edit
+                const idx = node.widgets?.indexOf(seqWidget);
+                if (idx >= 0 && Array.isArray(node.widgets_values)) {
+                    node.widgets_values[idx] = text;
+                }
+                try { seqWidget.callback?.(text); } catch { /* widget */ }
+                if (!opts?.silentUndo) tlNoteEdit();
                 void refresh();
                 if (!opts?.skipPersist) queueTimelinePersist();
             }
@@ -5277,6 +5281,7 @@ app.registerExtension({
                 if (skipTimelinePersist || openFolderBlocked()) return;
                 clearTimeout(persistTimer);
                 persistTimer = setTimeout(() => {
+                    if (skipTimelinePersist || openFolderBlocked()) return;
                     void api.fetchApi("/obvpm/h3/timeline_state", {
                         method: "POST",
                         headers: { "Content-Type": "application/json" },
@@ -5300,6 +5305,23 @@ app.registerExtension({
                 if (!resp.ok) throw new Error(await resp.text());
                 return resp.json();
             }
+            let holdSeq = 0;
+            function holdSequence(text) {
+                // subgraph widget callbacks can reconfigure the graph on
+                // a later tick and restore the old sequence widget; put
+                // the loaded cut back after that settles
+                const mine = ++holdSeq;
+                const paint = (silent) => {
+                    if (mine !== holdSeq) return;
+                    setSequence(text, {
+                        skipPersist: true, silentUndo: silent,
+                    });
+                };
+                paint(false);
+                queueMicrotask(() => paint(true));
+                setTimeout(() => paint(true), 0);
+                setTimeout(() => paint(true), 60);
+            }
             async function applyOpenFolder(folder) {
                 const cur = String(seqWidget.value || "").trim();
                 if (cur && tlParseSequence(cur).length) {
@@ -5308,21 +5330,49 @@ app.registerExtension({
                         "Replace the current timeline with the cut saved "
                         + "in " + label + "?")) return;
                 }
+                clearTimeout(persistTimer);
                 skipTimelinePersist = true;
                 try {
-                    if (!baseFolderWired()) {
-                        const fw = node.widgets?.find(
-                            (w) => w.name === "base_folder");
-                        if (fw) {
-                            fw.value = folder;
-                            fw.callback?.(folder, app.canvas, node);
-                        }
+                    const prevFolder = folderValue();
+                    if (prevFolder !== folder) {
+                        try {
+                            await api.fetchApi("/obvpm/h3/timeline_state", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({
+                                    action: "save",
+                                    base_folder: prevFolder,
+                                    sequence: seqWidget.value ?? "",
+                                }),
+                            });
+                        } catch { /* offline */ }
                     }
-                    const data = await loadTimelineFolder(folder);
-                    if (data.found) {
-                        setSequence(data.sequence ?? "", { skipPersist: true });
-                    } else {
-                        setSequence("", { skipPersist: true });
+                    let data;
+                    try {
+                        data = await loadTimelineFolder(folder);
+                    } catch (err) {
+                        app.extensionManager?.toast?.add?.({
+                            severity: "error",
+                            summary: "H3 Timeline",
+                            detail: String(err?.message ?? err).slice(0, 160),
+                            life: 6000,
+                        });
+                        return;
+                    }
+                    const text = data.found ? String(data.sequence ?? "") : "";
+                    if (!rpSetWidgetValue(node, "base_folder", folder)) {
+                        app.extensionManager?.toast?.add?.({
+                            severity: "warn",
+                            summary: "H3 Timeline",
+                            detail: "Could not write this folder along the "
+                                + "base_folder wire. Change it on the "
+                                + "source node.",
+                            life: 6000,
+                        });
+                        return;
+                    }
+                    holdSequence(text);
+                    if (!data.found) {
                         app.extensionManager?.toast?.add?.({
                             severity: "info",
                             summary: "H3 Timeline",
@@ -5359,29 +5409,22 @@ app.registerExtension({
                     }
                 }
                 await persistTimelineNow();
+                clearTimeout(persistTimer);
                 skipTimelinePersist = true;
                 try {
-                    if (!baseFolderWired()) {
-                        folder = await ensureFolder(folder);
-                        const fw = node.widgets?.find(
-                            (w) => w.name === "base_folder");
-                        if (fw) {
-                            fw.value = folder;
-                            fw.callback?.(folder, app.canvas, node);
-                        }
-                    } else {
+                    folder = await ensureFolder(folder);
+                    if (!rpSetWidgetValue(node, "base_folder", folder)) {
                         app.extensionManager?.toast?.add?.({
-                            severity: "info",
+                            severity: "warn",
                             summary: "H3 Timeline",
-                            detail: "base_folder is wired from another node, "
-                                + "so only the strip is cleared. Change the "
-                                + "folder on that source if this is a new "
-                                + "project directory.",
+                            detail: "Could not write this folder along the "
+                                + "base_folder wire. Change it on the "
+                                + "source node. The strip is still cleared.",
                             life: 6000,
                         });
                     }
                     setPinState(null);
-                    setSequence("", { skipPersist: true });
+                    holdSequence("");
                     single = null;
                     usingSingle = false;
                     await rescanPickerClips().catch(() => populatePicker());
@@ -5731,10 +5774,6 @@ app.registerExtension({
             });
             newBtn.addEventListener("click", (ev) => {
                 ev.stopPropagation();
-                if (baseFolderWired()) {
-                    void applyStartNew(folderValue());
-                    return;
-                }
                 void openFolderMenu("new");
             });
             // The seam-repair settings, sent with every build. They are
@@ -9246,6 +9285,105 @@ function rpWidgetValue(node, name) {
     if (!wired) return String(w.value ?? "");
     const traced = rpResolveInput(node, wired, RP_HOPS, null);
     return traced == null ? null : String(traced);
+}
+
+// Inverse of rpWidgetValue: write a string onto the widget that the
+// wire currently reads. The Timeline's base_folder is often a subgraph
+// output (instance widget -> boundary -> PrimitiveString -> output),
+// so setting the Timeline widget itself is a no-op; this walks back
+// and sets the source. false = nowhere to write.
+function rpSetWidget(w, node, value) {
+    if (!w) return false;
+    w.value = value;
+    const idx = node.widgets?.indexOf(w);
+    if (idx >= 0 && Array.isArray(node.widgets_values)) {
+        node.widgets_values[idx] = value;
+    }
+    try { w.callback?.(value, app.canvas, node); } catch { /* widget */ }
+    node.setDirtyCanvas?.(true, true);
+    return true;
+}
+
+function rpSetInput(node, slot, value, hops, ctx) {
+    if (!node || hops <= 0 || slot?.link == null) return false;
+    const link = rpLinkById(node.graph, slot.link);
+    if (!link) return false;
+    if (rpIsInputBoundary(node.graph, link.origin_id)) {
+        return ctx
+            ? rpSetSlot(ctx.node, link.origin_slot, value, hops - 1, ctx.parent)
+            : false;
+    }
+    const from = node.graph?.getNodeById?.(link.origin_id);
+    return from
+        ? rpSetOutput(from, link.origin_slot, value, hops - 1, ctx) : false;
+}
+
+function rpSetSlot(node, index, value, hops, ctx) {
+    const slot = node?.inputs?.[index];
+    if (!slot) return false;
+    if (slot.link != null) return rpSetInput(node, slot, value, hops, ctx);
+    const name = slot.widget?.name ?? slot.name;
+    const w = node.widgets?.find((x) => x.name === name);
+    return rpSetWidget(w, node, value);
+}
+
+function rpSetOutput(node, slotIndex, value, hops, ctx) {
+    if (!node || hops <= 0) return false;
+
+    const sub = node.subgraph;
+    if (sub) {
+        const out = sub.outputs?.[slotIndex];
+        const viaSlot = out?.getLinks?.()?.[0];
+        const boundary = sub.outputNode;
+        const viaBoundary = viaSlot
+            ? null : rpLinkById(sub, boundary?.inputs?.[slotIndex]?.link);
+        const link = viaSlot ?? viaBoundary;
+        if (!link) return false;
+        const inner = { node, parent: ctx };
+        if (rpIsInputBoundary(sub, link.origin_id)) {
+            return rpSetSlot(node, link.origin_slot, value, hops - 1, ctx);
+        }
+        const from = sub.getNodeById?.(link.origin_id);
+        return from
+            ? rpSetOutput(from, link.origin_slot, value, hops - 1, inner)
+            : false;
+    }
+
+    if (node.type === "GetNode") {
+        const key = String(node.widgets?.[0]?.value ?? "");
+        const setter = (node.graph?._nodes ?? []).find(
+            (n) => n.type === "SetNode"
+                   && String(n.widgets?.[0]?.value ?? "") === key);
+        return setter
+            ? rpSetInput(setter, setter.inputs?.[0], value, hops - 1, ctx)
+            : false;
+    }
+    if (node.type === "SetNode") {
+        return rpSetInput(node, node.inputs?.[0], value, hops - 1, ctx);
+    }
+
+    if (node.inputs?.length === 1 && node.outputs?.length === 1
+            && !node.widgets?.length) {
+        return rpSetInput(node, node.inputs[0], value, hops - 1, ctx);
+    }
+
+    const w = node.widgets?.find((x) => x.name === "value")
+        ?? (node.widgets?.length === 1 ? node.widgets[0] : null);
+    if (!w) return false;
+    const wired = (node.inputs ?? []).find(
+        (s) => (s.widget?.name === w.name || s.name === w.name)
+               && s.link != null);
+    if (wired) return rpSetInput(node, wired, value, hops - 1, ctx);
+    return rpSetWidget(w, node, value);
+}
+
+function rpSetWidgetValue(node, name, value) {
+    const w = node.widgets?.find((x) => x.name === name);
+    if (!w) return false;
+    const wired = (node.inputs ?? []).find(
+        (s) => (s.widget?.name === name || s.name === name) && s.link != null);
+    if (!wired) return rpSetWidget(w, node, value);
+    return rpSetInput(node, wired, value, RP_HOPS, null);
 }
 
 // The joined save prefix of one node: undefined if it is not a save node,
